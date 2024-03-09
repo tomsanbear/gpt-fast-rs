@@ -1,0 +1,19 @@
+[package]
+name = "gpt-fast-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = "1.0.197"
+anyhow = "1.0.80"
+tracing = "0.1.40"
+tracing-chrome = "0.7.1"
+tracing-subscriber = "0.3.18"
+hf-hub = "0.3.2"
+tokenizers = "0.15.2"
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.4.2", features = [
+    "cuda",
+] }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.4.2" }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.4.2" }
