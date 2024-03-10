@@ -1,14 +1,16 @@
 use crate::config::Config;
 use crate::utils::{scaled_dot_product_gqa, ScaledDotProductCfg};
-use anyhow::{Ok, Result};
+use anyhow::{anyhow, Ok, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::{embedding, linear, linear_no_bias, Embedding, Init, Linear, Module, VarBuilder};
+use candle_nn::{
+    embedding, layer_norm, linear, linear_no_bias, Embedding, Init, Linear, Module, VarBuilder,
+};
 
 struct TransformerBlock {
     attention: Attention,
     ffn: FeedForward,
     ffn_norm: RMSNorm,
-    attn_norm: RMSNorm,
+    attention_norm: RMSNorm,
 }
 
 impl TransformerBlock {
@@ -16,32 +18,105 @@ impl TransformerBlock {
         let attention = Attention::load(cfg.clone(), vb.pp("attn"))?;
         let ffn = FeedForward::load(cfg.clone(), vb.pp("ffn"))?;
         let ffn_norm = RMSNorm::load(cfg.dim, cfg.eps, vb.pp("ffn_norm"))?;
-        let attn_norm = RMSNorm::load(cfg.dim, cfg.eps, vb.pp("attn_norm"))?;
+        let attention_norm = RMSNorm::load(cfg.dim, cfg.eps, vb.pp("attn_norm"))?;
         Ok(Self {
             attention,
             ffn,
             ffn_norm,
-            attn_norm,
+            attention_norm,
         })
+    }
+
+    pub fn forward(
+        &mut self,
+        x: &Tensor,
+        input_pos: &Tensor,
+        freqs_cis: &Tensor,
+        mask: Tensor,
+    ) -> Result<Tensor> {
+        let h = (x + self.attention.forward(
+            &self.attention_norm.forward(&x)?,
+            freqs_cis,
+            mask,
+            Some(input_pos),
+        )?)?;
+        let out = h.add(&self.ffn.forward(&self.ffn_norm.forward(&h)?)?)?;
+        Ok(out)
     }
 }
 
 pub struct Transformer {
     tok_embeddings: Embedding,
     layers: Vec<TransformerBlock>,
+    norm: RMSNorm,
+    output: Linear,
+    freqs_cis: Tensor,
+    mask_cache: Option<Tensor>,
+    causal_mask: Tensor,
+    dim: usize,
+    n_head: usize,
 }
 
 impl Transformer {
     pub fn load(cfg: Config, vb: VarBuilder) -> Result<Self> {
-        let tok_embeddings = embedding(cfg.vocab_size, cfg.dim, vb.pp("tok_embeddings"))?;
+        let vocab_size = cfg.vocab_size;
+        let dim = cfg.dim;
+        let eps = cfg.eps;
+        let n_head = cfg.n_head;
+        let rope_base = cfg.rope_base;
+        let block_size = cfg.block_size;
+        let max_seq_length = cfg.max_seq_length;
+
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+
+        let tok_embeddings = embedding(vocab_size, dim, vb.pp("tok_embeddings"))?;
+        let norm = RMSNorm::load(dim, eps, vb.pp("norm"))?;
+        let output = linear_no_bias(dim, vocab_size, vb.pp("output"))?;
         let layers: Vec<_> = (0..cfg.n_layer)
             .map(move |i| TransformerBlock::load(cfg.clone(), vb.pp(format!("layer.{i}"))).unwrap())
             .collect();
 
+        let freqs_cis = precompute_freqs_cis(
+            block_size as u8,
+            dim.div_floor(n_head) as u8,
+            rope_base,
+            &device,
+        )?;
+
+        let causal_mask = Tensor::tril2(max_seq_length, dtype, &device.clone())?;
+
         Ok(Self {
             tok_embeddings,
             layers,
+            norm,
+            output,
+            freqs_cis,
+            mask_cache: None,
+            causal_mask,
+            dim,
+            n_head,
         })
+    }
+
+    pub fn forward(&mut self, idx: &Tensor, input_pos: &Tensor) -> Result<Tensor> {
+        let input_pos = input_pos;
+
+        let mask = self.causal_mask.index_select(&input_pos, 2)?;
+
+        // Original code is just shortcut for index_select
+        // freqs_cis = self.freqs_cis[input_pos]
+        let freqs_cis = self.freqs_cis.index_select(&input_pos, 0)?;
+        let x = self.tok_embeddings.forward(&idx)?;
+        // TODO: revisit the mask.clone call to avoid unnecessary clone
+        let x = self.layers.iter_mut().fold(x, |x, layer| {
+            layer
+                .forward(&x, &input_pos, &freqs_cis, mask.clone())
+                .unwrap()
+        });
+        let x = self.norm.forward(&x)?;
+        let logits = self.output.forward(&x)?;
+        Ok(logits)
     }
 }
 
@@ -71,14 +146,15 @@ impl KVCache {
         k: &Tensor,
         v: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        // need to spread input_pos to a range of positions
+        let input_pos = input_pos.to_vec1::<f32>()?[0] as usize;
         let k_shape = k.dims4()?;
         let k_out = self.k_cache.slice_assign(
             &[
                 0..k_shape.0,
                 0..k_shape.1,
-                0..k_shape.2,
+                input_pos..input_pos + 1,
                 0..k_shape.3,
-                input_pos,
             ],
             k,
         )?;
@@ -87,9 +163,8 @@ impl KVCache {
             &[
                 0..v_shape.0,
                 0..v_shape.1,
-                0..v_shape.2,
+                input_pos..input_pos + 1,
                 0..v_shape.3,
-                input_pos,
             ],
             v,
         )?;
@@ -172,7 +247,7 @@ impl Attention {
         x: &Tensor,
         freqs_cis: &Tensor,
         mask: Tensor,
-        input_pos: Option<Tensor>,
+        input_pos: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (bsz, seqlen, _) = x.dims3()?;
 

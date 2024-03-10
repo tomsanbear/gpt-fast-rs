@@ -1,14 +1,22 @@
 #![feature(int_roundings)]
 
 use anyhow::Result;
-use candle_core::{DType, Device};
+use candle_core::{
+    utils::{cuda_is_available, metal_is_available},
+    DType, Device, Tensor,
+};
 use candle_nn::{VarBuilder, VarMap};
 use clap::Parser;
 use tokenizers::tokenizer::Tokenizer;
 
-use crate::{config::Config, model::Transformer};
+use crate::{
+    config::Config,
+    generate::{generate, GenerateConfig},
+    model::Transformer,
+};
 
 mod config;
+mod generate;
 mod model;
 mod utils;
 
@@ -35,7 +43,7 @@ struct Args {
 
     /// The number of samples to generate.
     #[arg(long, default_value = "5")]
-    samples: usize,
+    num_samples: usize,
 
     /// Max new tokens
     #[arg(long, default_value = "100")]
@@ -43,15 +51,15 @@ struct Args {
 
     /// The temperature to use.
     #[arg(long, default_value = "0.8")]
-    temperature: f32,
+    temperature: f64,
 
     /// The top_k to use.
-    #[arg(long, default_value = "200")]
-    top_k: usize,
+    #[arg(long)]
+    top_k: Option<usize>,
 
     /// Speculative execution depth
-    #[arg(long, default_value = "5")]
-    speculate_k: usize,
+    #[arg(long)]
+    speculate_k: Option<usize>,
 
     /// Repo id for the model
     #[arg(long, default_value = "TinyLlama/TinyLlama-1.1B-Chat-v1.0")]
@@ -87,7 +95,13 @@ fn main() -> Result<()> {
     let device = if args.cpu {
         Device::Cpu
     } else {
-        Device::cuda_if_available(0)?
+        if cuda_is_available() {
+            Device::cuda_if_available(0)?
+        } else if metal_is_available() {
+            Device::new_metal(0)?
+        } else {
+            Device::Cpu
+        }
     };
 
     // Varmap and builder
@@ -95,7 +109,7 @@ fn main() -> Result<()> {
     let vb = VarBuilder::from_varmap(&varmap, dtype, &device);
 
     // Load the model
-    let model = Transformer::load(
+    let mut model = Transformer::load(
         Config {
             vocab_size: tokenizer.get_vocab_size(false),
             dim: 1024,
@@ -105,9 +119,35 @@ fn main() -> Result<()> {
             n_local_heads: 4,
             head_dim: 64,
             eps: 1e-6,
+            block_size: 1024,
+            max_seq_length: 1024,
+            rope_base: 128,
         },
         vb,
-    );
+    )?;
+
+    // Encode the prompt
+    let tokens = tokenizer
+        .encode("Large language models are ", false)
+        .unwrap();
+    let tokens = tokens.get_ids().to_vec();
+    let prompt = Tensor::new(tokens, &device)?;
+
+    // Generate
+    for _ in 0..args.num_samples {
+        generate(
+            &mut model,
+            &prompt,
+            GenerateConfig {
+                max_new_tokens: args.max_new_tokens,
+                temperature: args.temperature,
+                top_k: args.top_k,
+                speculate_k: args.speculate_k,
+                interactive: false,
+                block_size: 1024,
+            },
+        )?;
+    }
 
     Ok(())
 }
