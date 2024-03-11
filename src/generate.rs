@@ -20,17 +20,27 @@ pub fn generate(model: &mut Transformer, prompt: &Tensor, cfg: GenerateConfig) -
     let device = prompt.device();
     let dtype = prompt.dtype();
 
-    let t = prompt.dims()[0];
+    let t = prompt.dims1()?;
     let t_new = t + cfg.max_new_tokens;
-    let max_seq_len = min(t_new, cfg.block_size);
 
-    let seq = Tensor::zeros(t_new, dtype, device)?;
+    let max_seq_length = min(t_new, cfg.block_size);
+    model.setup_caches(1, max_seq_length)?;
+
+    let empty = Tensor::zeros(t_new, dtype, device)?;
+    let empty = empty.slice_assign(&[(0..t)], prompt)?;
+    let seq = empty.clone();
     let input_pos = Tensor::arange(0u32, t as u32, device)?;
 
-    let next_token = prefill(model, prompt, input_pos, cfg.temperature, cfg.top_k)?;
-    let seq = seq.slice_assign(&[t..t + 1], &seq)?;
+    let next_token = prefill(
+        model,
+        &prompt.reshape((1, ()))?,
+        input_pos,
+        cfg.temperature,
+        cfg.top_k,
+    )?;
+    let seq = seq.slice_assign(&[(t..(t + 1))], &next_token.unsqueeze(0)?)?;
 
-    let input_pos = Tensor::new(t as u8, &device)?;
+    let input_pos = Tensor::new(t as u32, &device)?.unsqueeze(0)?;
 
     // TODO: implement speculative execution
     //accept_counts = [0] * (speculate_k + 1)
@@ -48,7 +58,9 @@ pub fn generate(model: &mut Transformer, prompt: &Tensor, cfg: GenerateConfig) -
         cfg.temperature,
         cfg.top_k,
     )?;
-    let seq = seq.slice_assign(&[t..t + 1], &Tensor::cat(&generated_tokens, 0)?)?;
+    println!("seq: {:?}", seq.shape());
+    let generated_tokens = Tensor::cat(&generated_tokens, 0)?;
+    let seq = seq.slice_assign(&[(t + 1)..], &generated_tokens)?;
 
     Ok(seq)
 }
@@ -60,10 +72,11 @@ fn decode_one_token(
     temperature: f64,
     top_k: Option<usize>,
 ) -> Result<(Tensor, Tensor)> {
-    let logits = model.forward(&x, input_pos)?;
+    let logits = model.forward(&x.unsqueeze(0)?.unsqueeze(0)?, input_pos)?;
     let (idx_next, probs) = sample(logits, temperature, top_k)?;
     let idx_next = Tensor::new(idx_next, &x.device())?;
-    let probs = Tensor::from_vec(probs, x.shape(), x.device())?;
+    let probs_len = probs.len();
+    let probs = Tensor::from_vec(probs, probs_len, x.device())?;
     Ok((idx_next, probs))
 }
 
@@ -80,14 +93,14 @@ fn decode_n_tokens(
 
     let mut cur_token = cur_token.clone();
     let mut input_pos = input_pos.clone();
+    let one = Tensor::new(1u32, cur_token.device())?;
 
     for _ in 0..num_new_tokens {
-        let one = Tensor::new(1u8, cur_token.device()).unwrap();
         let (next_token, next_prob) =
-            decode_one_token(model, &cur_token, &input_pos, temperature, top_k).unwrap();
+            decode_one_token(model, &cur_token, &input_pos, temperature, top_k)?;
         cur_token = next_token.clone();
-        input_pos = (input_pos + one).unwrap();
-        new_tokens.push(next_token);
+        input_pos = (input_pos + one.clone().unsqueeze(0))?;
+        new_tokens.push(next_token.unsqueeze(0)?);
         new_probs.push(next_prob);
     }
 
@@ -96,7 +109,6 @@ fn decode_n_tokens(
 
 fn logits_to_probs(logits: Tensor, temperature: f64, top_k: Option<usize>) -> Result<Tensor> {
     let logits = (logits / (temperature.max(1e-5)))?;
-
     // TODO: implement tensor.topk function
     if top_k.is_some() {
         panic!("top_k not implemented");
@@ -113,9 +125,9 @@ fn sample_multinomial(prs: &Vec<f32>) -> Result<u32> {
 }
 
 fn sample(logits: Tensor, temperature: f64, topk: Option<usize>) -> Result<(u32, Vec<f32>)> {
-    let probs = logits_to_probs(logits.i((0, ..))?, temperature, topk)?
-        .to_dtype(DType::F32)?
-        .to_vec1::<f32>()?;
+    let logits = logits.squeeze(0)?.i((0, ..))?;
+    let probs = logits_to_probs(logits, temperature, topk)?;
+    let probs = probs.to_dtype(DType::F32)?.to_vec1::<f32>()?;
     let idx_next = sample_multinomial(&probs)?;
     Ok((idx_next, probs))
 }

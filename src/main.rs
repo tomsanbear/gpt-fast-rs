@@ -36,7 +36,7 @@ struct Args {
     tracing: bool,
 
     /// Run on CPU rather than on GPU.
-    #[arg(long)]
+    #[arg(long, default_value = "false")]
     cpu: bool,
 
     /// The prompt to use
@@ -48,7 +48,7 @@ struct Args {
     num_samples: usize,
 
     /// Max new tokens
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value = "10")]
     max_new_tokens: usize,
 
     /// The temperature to use.
@@ -85,7 +85,7 @@ fn main() -> Result<()> {
     // Tokenizer setup
     let tokenizer = {
         let api = hf_hub::api::sync::Api::new()?;
-        let api = api.model("hf-internal-testing/llama-tokenizer".to_string());
+        let api = api.model(args.repo_id.clone());
         let tokenizer_path = api.get("tokenizer.json")?;
         Tokenizer::from_file(tokenizer_path).unwrap()
     };
@@ -110,14 +110,14 @@ fn main() -> Result<()> {
     let mut varmap = VarMap::new();
     {
         let api = hf_hub::api::sync::Api::new()?;
-        let api = api.model(args.repo_id);
+        let api = api.model(args.repo_id.clone());
         let model_path = api.get("model.safetensors")?;
         varmap.load(path::Path::new(&model_path))?;
     }
     let vb = VarBuilder::from_varmap(&varmap, dtype, &device);
 
     // Load the model
-    let dim = 4096;
+    let dim = 2048;
     let intermediate_size = {
         let hidden_dim = dim * 4;
         let n_hidden = (2 * hidden_dim) / (3);
@@ -126,6 +126,7 @@ fn main() -> Result<()> {
     let n_head = 32;
     let n_local_heads = 32;
     let head_dim = dim / n_head;
+    let block_size = 1024;
     let mut model = Transformer::load(
         Config {
             vocab_size: tokenizer.get_vocab_size(false),
@@ -136,19 +137,21 @@ fn main() -> Result<()> {
             n_local_heads,
             head_dim,
             eps: 1e-5,
-            block_size: 2048,
+            block_size,
             max_seq_length: 100,
             rope_base: 10000,
         },
         vb,
     )?;
+    println!("finished loading model");
 
     // Encode the prompt
     let tokens = tokenizer
         .encode("Large language models are ", false)
         .unwrap();
     let tokens = tokens.get_ids().to_vec();
-    let prompt = Tensor::new(tokens, &device)?.unsqueeze(0)?;
+    let prompt = Tensor::new(tokens, &device)?;
+    println!("finished encoding prompt");
 
     // Generate
     for _ in 0..args.num_samples {
@@ -161,7 +164,7 @@ fn main() -> Result<()> {
                 top_k: args.top_k,
                 speculate_k: args.speculate_k,
                 interactive: false,
-                block_size: 1024,
+                block_size,
             },
         )?;
     }

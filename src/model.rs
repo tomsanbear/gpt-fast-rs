@@ -34,12 +34,11 @@ impl TransformerBlock {
         freqs_cis: &Tensor,
         mask: Tensor,
     ) -> Result<Tensor> {
-        let h = (x + self.attention.forward(
-            &self.attention_norm.forward(&x)?,
-            freqs_cis,
-            mask,
-            input_pos,
-        )?)?;
+        let x_norm = self.attention_norm.forward(&x)?;
+        let h = self
+            .attention
+            .forward(&x_norm, freqs_cis, mask, input_pos)?
+            .add(&x)?;
         let out = h.add(&self.ffn.forward(&self.ffn_norm.forward(&h)?)?)?;
         Ok(out)
     }
@@ -55,6 +54,12 @@ pub struct Transformer {
     causal_mask: Tensor,
     dim: usize,
     n_head: usize,
+    rope_base: usize,
+    max_seq_length: usize,
+    block_size: usize,
+    device: Device,
+    dtype: DType,
+    max_batch_size: usize,
 }
 
 impl Transformer {
@@ -65,7 +70,6 @@ impl Transformer {
         let n_head = cfg.n_head;
         let rope_base = cfg.rope_base;
         let block_size = cfg.block_size;
-        let max_seq_length = find_multiple(cfg.max_seq_length, 8);
 
         let device = vb.device().clone();
         let dtype = vb.dtype();
@@ -77,13 +81,9 @@ impl Transformer {
             .map(move |i| TransformerBlock::load(cfg.clone(), vb.pp(format!("layer.{i}"))).unwrap())
             .collect();
 
-        let freqs_cis = {
-            let n_elem = dim / n_head;
-            let freqs_cis = precompute_freqs_cis(block_size, n_elem, rope_base, &device)?;
-            freqs_cis.contiguous()?
-        };
-
-        let causal_mask = Tensor::tril2(max_seq_length, dtype, &device.clone())?.unsqueeze(0)?;
+        // TODO: swap out for use of option instead
+        let freqs_cis = Tensor::zeros(1, dtype, &device)?;
+        let causal_mask = Tensor::zeros(1, dtype, &device)?;
 
         Ok(Self {
             tok_embeddings,
@@ -95,19 +95,50 @@ impl Transformer {
             causal_mask,
             dim,
             n_head,
+            rope_base,
+            max_seq_length: 0,
+            block_size,
+            device,
+            dtype,
+            max_batch_size: 0,
         })
     }
 
-    pub fn forward(&mut self, idx: &Tensor, input_pos: &Tensor) -> Result<Tensor> {
-        let input_pos = input_pos;
+    pub fn setup_caches(&mut self, max_batch_size: usize, max_seq_length: usize) -> Result<()> {
+        if self.max_seq_length >= max_seq_length && self.max_batch_size >= max_batch_size {
+            return Ok(());
+        }
 
+        let dim = self.dim;
+        let n_head = self.n_head;
+        let rope_base = self.rope_base;
+        let block_size = self.block_size;
+        let max_seq_length = find_multiple(max_seq_length, 8);
+        self.max_seq_length = max_seq_length;
+        self.max_batch_size = max_batch_size;
+        let device = self.device.clone();
+
+        // TODO: initialize kvcache
+
+        self.freqs_cis = {
+            let n_elem = dim / n_head;
+            let freqs_cis = precompute_freqs_cis(block_size, n_elem, rope_base, &device)?;
+            freqs_cis.contiguous()?
+        };
+
+        self.causal_mask =
+            Tensor::tril2(max_seq_length, self.dtype, &device.clone())?.unsqueeze(0)?;
+
+        Ok(())
+    }
+
+    pub fn forward(&mut self, idx: &Tensor, input_pos: &Tensor) -> Result<Tensor> {
         let mask = self.causal_mask.index_select(&input_pos, 2)?;
 
         // Original code is just shortcut for index_select
         // freqs_cis = self.freqs_cis[input_pos]
         let freqs_cis = self.freqs_cis.index_select(&input_pos, 0)?;
         let x = self.tok_embeddings.forward(&idx)?;
-        println!("x {:?}", x.dims());
         let x = self.layers.iter_mut().fold(x, |x, layer| {
             layer
                 .forward(&x, &input_pos, &freqs_cis, mask.clone())
@@ -266,20 +297,23 @@ impl Attention {
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
 
-        let (k, v) = if let Some(kv_cache) = &mut self.kv_cache {
-            let (k, v) = kv_cache.update(&input_pos, &k, &v)?;
-            (k, v)
-        } else {
-            (k, v)
-        };
+        // TODO: come back and figure out this one
+        // let (k, v) = if let Some(kv_cache) = &mut self.kv_cache {
+        //     let (k, v) = kv_cache.update(&input_pos, &k, &v)?;
+        //     (k, v)
+        // } else {
+        //     (k, v)
+        // };
+        // let k = repeat_interleave(&k, self.n_head.div_floor(self.n_local_heads), 1)?;
+        // let v = repeat_interleave(&v, self.n_head.div_floor(self.n_local_heads), 1)?;
 
-        let k = repeat_interleave(&k, self.n_head.div_floor(self.n_local_heads), 1)?;
-        let v = repeat_interleave(&v, self.n_head.div_floor(self.n_local_heads), 1)?;
         let (y, _) = scaled_dot_product_gqa(
             q,
             k,
             v,
-            Some(mask),
+            // TODO: get the mask reshaping working
+            // Some(mask),
+            None,
             ScaledDotProductCfg {
                 is_causal: false,
                 need_weights: false,
@@ -339,20 +373,18 @@ fn precompute_freqs_cis(
 }
 
 fn apply_rotary_emb(x: &Tensor, freqs_cis: &Tensor) -> Result<Tensor> {
-    println!("x {:?}", x.dims());
     let x_shaped = x.reshape((x.dims()[0], x.dims()[1], x.dims()[2], (), 2))?;
-    println!("x_shaped {:?}", x_shaped.dims());
-    println!("freqs_cis {:?}", freqs_cis.dims());
-    let freqs_cis = freqs_cis.reshape((1, x_shaped.dims()[1], 1, x_shaped.dims()[3], 2))?;
-    let x_out_2 = Tensor::stack(
-        &[
-            ((x_shaped.i((.., .., .., 0))? * freqs_cis.i((.., .., .., 0)))?
-                - (x_shaped.i((.., .., .., 1))? * freqs_cis.i((.., .., .., 1)))?)?,
-            ((x_shaped.i((.., .., .., 1))? * freqs_cis.i((.., .., .., 0)))?
-                - (x_shaped.i((.., .., .., 0))? * freqs_cis.i((.., .., .., 1)))?)?,
-        ],
-        D::Minus1,
-    )?;
+    let freqs_cis = freqs_cis.reshape(x_shaped.shape())?;
+    // TODO: getting a shape mismatch with the original code from fastgpt, need to investigate the meaning behind their weird reshape
+    // let freqs_cis = freqs_cis.reshape((1, x_shaped.dims()[1], 1, x_shaped.dims()[3], 2))?
+    let x_out_2 = {
+        let first = ((x_shaped.i((.., .., .., .., 0))? * freqs_cis.i((.., .., .., .., 0)))?
+            - (x_shaped.i((.., .., .., .., 1))? * freqs_cis.i((.., .., .., .., 1)))?)?;
+        let second = ((x_shaped.i((.., .., .., .., 1))? * freqs_cis.i((.., .., .., .., 0)))?
+            + (x_shaped.i((.., .., .., .., 0))? * freqs_cis.i((.., .., .., .., 1)))?)?;
+        let x_out_2: Tensor = Tensor::stack(&[first, second], D::Minus1)?;
+        x_out_2
+    };
     let x_out_2 = x_out_2.flatten(3, D::Minus1)?;
     Ok(x_out_2)
 }

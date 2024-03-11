@@ -76,7 +76,7 @@ pub fn scaled_dot_product_gqa(
             let query_for_matmul = query_reshaped.sum(1)?;
 
             // Transpose the last two dimensions of key to align them for matmul.
-            let key_transposed = key.transpose(D::Minus2, D::Minus1)?; // [batch, heads, depth, seq_len]
+            let key_transposed: Tensor = key.transpose(D::Minus2, D::Minus1)?; // [batch, heads, depth, seq_len]
 
             // Perform batched matrix multiplication.
             query_for_matmul.matmul(&key_transposed.contiguous()?)
@@ -85,25 +85,10 @@ pub fn scaled_dot_product_gqa(
             // If the number of query/key heads is equal, we can skip grouping the queries,
             // and just use the standard sdot product attention.
             // einsum(query, key, "b h n d, b h s d -> b h n s")
-            let query = query.unsqueeze(3)?;
-            let key_t = key.transpose(D::Minus2, D::Minus1)?;
-            query.matmul(&key_t)
+            let key_transposed: Tensor = key.transpose(D::Minus2, D::Minus1)?; // [batch, heads, depth, seq_len]
+            query.matmul(&key_transposed.contiguous()?)
         }
     }?;
-
-    // Expand mask to match the shape of the attn matrix
-    let mask = match mask {
-        Some(mask) => Some({
-            if mask.shape().dims().len() == 2 {
-                mask.unsqueeze(1)?.unsqueeze(2)?
-            } else if mask.dims().len() == 3 {
-                mask.unsqueeze(1)?
-            } else {
-                mask
-            }
-        }),
-        None => None,
-    };
 
     let similarity = match mask {
         Some(mask) => {
