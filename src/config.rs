@@ -9,6 +9,6 @@ pub struct Config {
     pub(crate) head_dim: usize,
     pub(crate) eps: f32,
     pub(crate) block_size: usize,
-    pub(crate) rope_base: u8,
+    pub(crate) rope_base: usize,
     pub(crate) max_seq_length: usize,
 }

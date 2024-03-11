@@ -1,5 +1,7 @@
 #![feature(int_roundings)]
 
+use std::path;
+
 use anyhow::Result;
 use candle_core::{
     utils::{cuda_is_available, metal_is_available},
@@ -12,7 +14,7 @@ use tokenizers::tokenizer::Tokenizer;
 use crate::{
     config::Config,
     generate::{generate, GenerateConfig},
-    model::Transformer,
+    model::{find_multiple, Transformer},
 };
 
 mod config;
@@ -89,7 +91,7 @@ fn main() -> Result<()> {
     };
 
     // Use bf16 for computation
-    let dtype = DType::BF16;
+    let dtype = DType::F32;
 
     // Use CUDA if available
     let device = if args.cpu {
@@ -104,24 +106,39 @@ fn main() -> Result<()> {
         }
     };
 
-    // Varmap and builder
-    let varmap = VarMap::new();
+    // Varmap and builder, load model from the repo
+    let mut varmap = VarMap::new();
+    {
+        let api = hf_hub::api::sync::Api::new()?;
+        let api = api.model(args.repo_id);
+        let model_path = api.get("model.safetensors")?;
+        varmap.load(path::Path::new(&model_path))?;
+    }
     let vb = VarBuilder::from_varmap(&varmap, dtype, &device);
 
     // Load the model
+    let dim = 4096;
+    let intermediate_size = {
+        let hidden_dim = dim * 4;
+        let n_hidden = (2 * hidden_dim) / (3);
+        find_multiple(n_hidden, 256)
+    };
+    let n_head = 32;
+    let n_local_heads = 32;
+    let head_dim = dim / n_head;
     let mut model = Transformer::load(
         Config {
             vocab_size: tokenizer.get_vocab_size(false),
-            dim: 1024,
-            n_layer: 24,
-            intermediate_size: 4096,
-            n_head: 16,
-            n_local_heads: 4,
-            head_dim: 64,
-            eps: 1e-6,
-            block_size: 1024,
-            max_seq_length: 1024,
-            rope_base: 128,
+            dim,
+            intermediate_size,
+            n_layer: 32,
+            n_head,
+            n_local_heads,
+            head_dim,
+            eps: 1e-5,
+            block_size: 2048,
+            max_seq_length: 100,
+            rope_base: 10000,
         },
         vb,
     )?;
@@ -131,7 +148,7 @@ fn main() -> Result<()> {
         .encode("Large language models are ", false)
         .unwrap();
     let tokens = tokens.get_ids().to_vec();
-    let prompt = Tensor::new(tokens, &device)?;
+    let prompt = Tensor::new(tokens, &device)?.unsqueeze(0)?;
 
     // Generate
     for _ in 0..args.num_samples {

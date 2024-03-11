@@ -25,7 +25,7 @@ pub fn generate(model: &mut Transformer, prompt: &Tensor, cfg: GenerateConfig) -
     let max_seq_len = min(t_new, cfg.block_size);
 
     let seq = Tensor::zeros(t_new, dtype, device)?;
-    let input_pos = Tensor::arange(0, t as u8, device)?;
+    let input_pos = Tensor::arange(0u32, t as u32, device)?;
 
     let next_token = prefill(model, prompt, input_pos, cfg.temperature, cfg.top_k)?;
     let seq = seq.slice_assign(&[t..t + 1], &seq)?;

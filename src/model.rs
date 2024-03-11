@@ -1,10 +1,10 @@
+use std::ops::Rem;
+
 use crate::config::Config;
 use crate::utils::{scaled_dot_product_gqa, ScaledDotProductCfg};
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{Ok, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::{
-    embedding, layer_norm, linear, linear_no_bias, Embedding, Init, Linear, Module, VarBuilder,
-};
+use candle_nn::{embedding, linear, linear_no_bias, Embedding, Init, Linear, Module, VarBuilder};
 
 struct TransformerBlock {
     attention: Attention,
@@ -38,7 +38,7 @@ impl TransformerBlock {
             &self.attention_norm.forward(&x)?,
             freqs_cis,
             mask,
-            Some(input_pos),
+            input_pos,
         )?)?;
         let out = h.add(&self.ffn.forward(&self.ffn_norm.forward(&h)?)?)?;
         Ok(out)
@@ -65,7 +65,7 @@ impl Transformer {
         let n_head = cfg.n_head;
         let rope_base = cfg.rope_base;
         let block_size = cfg.block_size;
-        let max_seq_length = cfg.max_seq_length;
+        let max_seq_length = find_multiple(cfg.max_seq_length, 8);
 
         let device = vb.device().clone();
         let dtype = vb.dtype();
@@ -77,14 +77,13 @@ impl Transformer {
             .map(move |i| TransformerBlock::load(cfg.clone(), vb.pp(format!("layer.{i}"))).unwrap())
             .collect();
 
-        let freqs_cis = precompute_freqs_cis(
-            block_size as u8,
-            dim.div_floor(n_head) as u8,
-            rope_base,
-            &device,
-        )?;
+        let freqs_cis = {
+            let n_elem = dim / n_head;
+            let freqs_cis = precompute_freqs_cis(block_size, n_elem, rope_base, &device)?;
+            freqs_cis.contiguous()?
+        };
 
-        let causal_mask = Tensor::tril2(max_seq_length, dtype, &device.clone())?;
+        let causal_mask = Tensor::tril2(max_seq_length, dtype, &device.clone())?.unsqueeze(0)?;
 
         Ok(Self {
             tok_embeddings,
@@ -108,7 +107,7 @@ impl Transformer {
         // freqs_cis = self.freqs_cis[input_pos]
         let freqs_cis = self.freqs_cis.index_select(&input_pos, 0)?;
         let x = self.tok_embeddings.forward(&idx)?;
-        // TODO: revisit the mask.clone call to avoid unnecessary clone
+        println!("x {:?}", x.dims());
         let x = self.layers.iter_mut().fold(x, |x, layer| {
             layer
                 .forward(&x, &input_pos, &freqs_cis, mask.clone())
@@ -184,14 +183,11 @@ impl RMSNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x
-            .div(
-                &x.mul(&x)?
-                    .mean_keepdim(D::Minus1)?
-                    .broadcast_add(&Tensor::new(self.eps, &x.device())?)?
-                    .sqrt()?,
-            )?
-            .mul(&self.weight)?;
+        let x_d = (x * x)?
+            .mean_keepdim(D::Minus1)?
+            .broadcast_add(&Tensor::new(self.eps, &x.device())?)?
+            .sqrt()?;
+        let x = x.broadcast_div(&x_d)?.broadcast_mul(&self.weight)?;
         Ok(x)
     }
 }
@@ -247,28 +243,31 @@ impl Attention {
         x: &Tensor,
         freqs_cis: &Tensor,
         mask: Tensor,
-        input_pos: Option<&Tensor>,
+        input_pos: &Tensor,
     ) -> Result<Tensor> {
-        let (bsz, seqlen, _) = x.dims3()?;
-
+        let bsz = x.dims()[0];
+        let seqlen = x.dims()[1];
         let kv_size = self.n_local_heads * self.head_dim;
-        let q = x.i((.., .., 0..self.dim))?;
-        let k = x.i((.., .., self.dim..(self.dim + kv_size)))?;
-        let v = x.i((.., .., (self.dim + kv_size)..))?;
+
+        let qkv = self.wqkv.forward(&x)?;
+
+        let q = qkv.i((.., .., 0..self.dim))?;
+        let k = qkv.i((.., .., self.dim..(self.dim + kv_size)))?;
+        let v = qkv.i((.., .., (self.dim + kv_size)..))?;
 
         let q = q.reshape((bsz, seqlen, self.n_head, self.head_dim))?;
         let k = k.reshape((bsz, seqlen, self.n_local_heads, self.head_dim))?;
         let v = v.reshape((bsz, seqlen, self.n_local_heads, self.head_dim))?;
 
-        let q = apply_rotary_emb(&q, &freqs_cis)?;
         let k = apply_rotary_emb(&k, &freqs_cis)?;
+        let q = apply_rotary_emb(&q, &freqs_cis)?;
 
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
 
         let (k, v) = if let Some(kv_cache) = &mut self.kv_cache {
-            let (k, v) = kv_cache.update(&input_pos.unwrap(), &k, &v)?;
+            let (k, v) = kv_cache.update(&input_pos, &k, &v)?;
             (k, v)
         } else {
             (k, v)
@@ -299,10 +298,10 @@ impl Attention {
     }
 }
 
-fn outer(x: &Tensor, y: &Tensor) -> Result<Tensor> {
-    let x = x.unsqueeze(D::Minus1)?;
-    let y = y.unsqueeze(0)?;
-    Ok((x * y)?)
+fn outer(x: Tensor, y: Tensor) -> Result<Tensor> {
+    let x = x.unsqueeze(0)?;
+    let y = y.unsqueeze(0)?.transpose(0, 1)?;
+    Ok(x.broadcast_mul(&y)?)
 }
 
 fn polar(abs: &Tensor, angle: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -311,21 +310,40 @@ fn polar(abs: &Tensor, angle: &Tensor) -> Result<(Tensor, Tensor)> {
     Ok((real, imag))
 }
 
-fn precompute_freqs_cis(seq_len: u8, n_elem: u8, base: u8, device: &Device) -> Result<Tensor> {
-    let freqs = (1.0
-        / Tensor::new(base, &device)?.broadcast_pow(
-            &Tensor::arange_step(0, n_elem, 2, device)?.i(0..(n_elem.div_floor(2).into()))?,
-        )?)?;
-    let t = Tensor::arange(0, seq_len, &device)?;
-    let freqs = outer(&t, &freqs)?;
-    let freqs_cis = polar(&freqs.ones_like()?, &freqs)?;
-    let cache = Tensor::stack(&[freqs_cis.0, freqs_cis.1], D::Minus1)?;
+fn precompute_freqs_cis(
+    seq_len: usize,
+    n_elem: usize,
+    base: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    // freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
+    let freqs =
+        Tensor::arange_step(0.0f32, n_elem as f32, 2.0, device)?.i(0..((n_elem / 2).into()))?;
+    let base = Tensor::new(base as f32, &device)?;
+    let freqs = base.broadcast_pow(&freqs)?;
+    let freqs = (1.0 / freqs)?;
+
+    // t = torch.arange(seq_len, device=freqs.device)
+    let t = Tensor::arange(0.0f32, seq_len as f32, &device)?;
+
+    // freqs = torch.outer(t, freqs)
+    let freqs = outer(t, freqs)?;
+
+    // torch.polar(torch.ones_like(freqs), freqs)
+    let (real, imag) = polar(&freqs.ones_like()?, &freqs)?;
+
+    // cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
+    let cache = Tensor::stack(&[real, imag], D::Minus1)?;
+
     Ok(cache)
 }
 
 fn apply_rotary_emb(x: &Tensor, freqs_cis: &Tensor) -> Result<Tensor> {
-    let x_shaped = x.reshape((x.dims4()?.0, x.dims4()?.1, x.dims4()?.2 - 1, 2))?;
-    let freqs_cis = freqs_cis.reshape((1, x_shaped.dims4()?.1, 1, x_shaped.dims4()?.3, 2))?;
+    println!("x {:?}", x.dims());
+    let x_shaped = x.reshape((x.dims()[0], x.dims()[1], x.dims()[2], (), 2))?;
+    println!("x_shaped {:?}", x_shaped.dims());
+    println!("freqs_cis {:?}", freqs_cis.dims());
+    let freqs_cis = freqs_cis.reshape((1, x_shaped.dims()[1], 1, x_shaped.dims()[3], 2))?;
     let x_out_2 = Tensor::stack(
         &[
             ((x_shaped.i((.., .., .., 0))? * freqs_cis.i((.., .., .., 0)))?
@@ -343,4 +361,12 @@ fn repeat_interleave(x: &Tensor, n: usize, dim: usize) -> Result<Tensor> {
     let x = x.unsqueeze(1)?;
     let x = x.repeat(&[1, n, 1])?;
     Ok(x.flatten(1, D::Minus1)?)
+}
+
+pub fn find_multiple(x: usize, y: usize) -> usize {
+    if x.rem(y) == 0 {
+        x
+    } else {
+        x + y - x.rem(y)
+    }
 }
