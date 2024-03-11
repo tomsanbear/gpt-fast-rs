@@ -58,9 +58,9 @@ pub fn generate(model: &mut Transformer, prompt: &Tensor, cfg: GenerateConfig) -
         cfg.temperature,
         cfg.top_k,
     )?;
-    println!("seq: {:?}", seq.shape());
     let generated_tokens = Tensor::cat(&generated_tokens, 0)?;
     let seq = seq.slice_assign(&[(t + 1)..], &generated_tokens)?;
+
 
     Ok(seq)
 }

@@ -154,8 +154,9 @@ fn main() -> Result<()> {
     println!("finished encoding prompt");
 
     // Generate
-    for _ in 0..args.num_samples {
-        generate(
+    for i in 0..args.num_samples {
+        let start_gen = std::time::Instant::now();
+        let generated_tokens = generate(
             &mut model,
             &prompt,
             GenerateConfig {
@@ -167,6 +168,10 @@ fn main() -> Result<()> {
                 block_size,
             },
         )?;
+        let dt = start_gen.elapsed().as_secs_f64();
+        let tokens_generated = generated_tokens.dims()[0] - prompt.dims()[0];
+        let tokens_sec = tokens_generated as f64 / dt;
+        println!("Time for inference {i}: {dt} sec total, {tokens_sec} tokens/sec");
     }
 
     Ok(())
